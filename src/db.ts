@@ -206,10 +206,16 @@ export class SpeedDatabase {
 
   /** 오늘(KST 기준) 측정 기록 조회 */
   getTodayRecords(timezone = 'Asia/Seoul'): SpeedRecord[] {
-    // 오늘 날짜를 해당 타임존으로 계산
-    const now = new Date();
-    const todayStr = now.toLocaleDateString('sv-SE', { timeZone: timezone }); // YYYY-MM-DD
-    return this.getHistory(9999).filter((r) => r.measured_at.startsWith(todayStr));
+    // measured_at은 UTC ISO 문자열(`...Z`)로 저장되므로, startsWith로 비교하면
+    // KST 00:00–08:59(UTC 전날) 시간대의 기록이 누락된다.
+    // 각 레코드의 UTC 시각을 타임존 로컬 날짜로 변환해서 비교한다.
+    const todayStr = new Date().toLocaleDateString('sv-SE', { timeZone: timezone }); // YYYY-MM-DD
+    return this.getHistory(9999).filter((r) => {
+      const recordDate = new Date(r.measured_at);
+      if (isNaN(recordDate.getTime())) return false;
+      const localDate = recordDate.toLocaleDateString('sv-SE', { timeZone: timezone });
+      return localDate === todayStr;
+    });
   }
 
   /** 오늘 감면 신청 성공 여부 */

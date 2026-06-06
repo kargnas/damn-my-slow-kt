@@ -1,6 +1,6 @@
 {
   "name": "damn-my-slow-kt",
-  "version": "0.5.27",
+  "version": "0.5.28",
   "description": "KT 인터넷 SLA 속도 미달 시 요금 감면을 자동화하는 CLI 도구",
   "keywords": [
     "kt",

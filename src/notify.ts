@@ -1,5 +1,5 @@
 /**
- * Discord / Telegram 알림
+ * Discord / Slack / Telegram 알림
  */
 
 import axios from 'axios';
@@ -58,6 +58,27 @@ export async function notifyDiscord(webhookUrl: string, record: SpeedRecord): Pr
   }
 }
 
+export async function notifySlack(webhookUrl: string, record: SpeedRecord): Promise<boolean> {
+  if (!webhookUrl) return false;
+
+  // Slack mrkdwn은 볼드가 *단일 별표* — Discord용 **를 변환
+  const message = formatRecord(record).replace(/\*\*/g, '*');
+
+  try {
+    await axios.post(
+      webhookUrl,
+      { text: `🐌 damn-my-slow-kt\n${message}` },
+      { timeout: 10000 }
+    );
+    console.log('Slack 알림 전송 완료');
+    return true;
+  } catch (e: unknown) {
+    const err = e instanceof Error ? e : new Error(String(e));
+    console.error(`Slack 알림 실패: ${err.message}`);
+    return false;
+  }
+}
+
 export async function notifyTelegram(
   botToken: string,
   chatId: string,
@@ -88,6 +109,10 @@ export async function sendNotifications(config: Config, record: SpeedRecord): Pr
 
   if (notif.discord_webhook) {
     await notifyDiscord(notif.discord_webhook, record);
+  }
+
+  if (notif.slack_webhook) {
+    await notifySlack(notif.slack_webhook, record);
   }
 
   if (notif.telegram_bot_token && notif.telegram_chat_id) {

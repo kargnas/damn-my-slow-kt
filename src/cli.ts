@@ -172,6 +172,12 @@ export function buildCli(): Command {
         },
         {
           type: "input",
+          name: "slack_webhook",
+          message: "Slack 웹훅 URL (없으면 엔터):",
+          default: existing?.notification.slack_webhook || "",
+        },
+        {
+          type: "input",
           name: "telegram_token",
           message: "Telegram 봇 토큰 (없으면 엔터):",
           default: existing?.notification.telegram_bot_token || "",
@@ -219,6 +225,7 @@ export function buildCli(): Command {
         },
         notification: {
           discord_webhook: answers.discord_webhook,
+          slack_webhook: answers.slack_webhook,
           telegram_bot_token: answers.telegram_token,
           telegram_chat_id: telegramChatId,
         },
@@ -660,6 +667,9 @@ export function buildCli(): Command {
       );
       console.log(
         `Discord 웹훅: ${cfg.notification.discord_webhook ? "설정됨" : "없음"}`,
+      );
+      console.log(
+        `Slack 웹훅: ${cfg.notification.slack_webhook ? "설정됨" : "없음"}`,
       );
       console.log(
         `Telegram: ${cfg.notification.telegram_bot_token ? "설정됨" : "없음"}`,

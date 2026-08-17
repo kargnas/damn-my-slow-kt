@@ -33,6 +33,7 @@ export interface Schedule {
 
 export interface Notification {
   discord_webhook: string;
+  slack_webhook: string;
   telegram_bot_token: string;
   telegram_chat_id: string;
 }
@@ -66,6 +67,7 @@ export function getDefaultConfig(): Config {
     },
     notification: {
       discord_webhook: '',
+      slack_webhook: '',
       telegram_bot_token: '',
       telegram_chat_id: '',
     },
@@ -113,6 +115,7 @@ export function loadConfig(configPath?: string): Config {
     },
     notification: {
       discord_webhook: notif.discord_webhook || '',
+      slack_webhook: notif.slack_webhook || '',
       telegram_bot_token: notif.telegram_bot_token || '',
       telegram_chat_id: notif.telegram_chat_id || '',
     },
@@ -143,6 +146,7 @@ export function saveConfig(config: Config, configPath?: string): void {
     },
     notification: {
       discord_webhook: config.notification.discord_webhook,
+      slack_webhook: config.notification.slack_webhook,
       telegram_bot_token: config.notification.telegram_bot_token,
       telegram_chat_id: config.notification.telegram_chat_id,
     },
@@ -188,6 +192,7 @@ schedule:
 
 notification:
   discord_webhook: ""  # Discord 웹훅 URL (선택)
+  slack_webhook: ""  # Slack Incoming Webhook URL (선택)
   telegram_bot_token: ""  # Telegram 봇 토큰 (선택)
   telegram_chat_id: ""  # Telegram 채팅 ID (선택)
 

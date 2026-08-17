@@ -131,6 +131,7 @@ schedule:
 
 notification:
   discord_webhook: ""    # Discord 알림 (선택)
+  slack_webhook: ""      # Slack 알림 (선택, Incoming Webhook URL)
   telegram_bot_token: "" # Telegram 알림 (선택)
 ```
 

@@ -310,6 +310,7 @@ export class KTProvider {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private startedSpeedClient = false;
+  private debugMode = false;
 
   constructor(config: Config) {
     this.config = config;
@@ -329,6 +330,7 @@ export class KTProvider {
     // 원인 추정이 어려운 상황(이슈 #3의 신규 기기 등록/다회선 주소지 선택/회선 미보유 등)에서
     // 사용자가 직접 브라우저를 관찰할 수 있게 한다. config.headless 값을 덮어씀.
     const headless = debug ? false : this.config.headless;
+    this.debugMode = debug;
     const launchOptions = {
       headless,
       slowMo: debug ? 250 : 0,
@@ -587,35 +589,113 @@ export class KTProvider {
 
     info('KT 로그인 페이지 감지...');
     await this.fillLoginForm(id, password);
+    await this.postLoginChecks();
+  }
+
+  // 로그인 제출 직후의 공통 처리: 리다이렉트 대기 → 자격증명 오류 확인 →
+  // 비밀번호 변경 안내 스킵 → 추가 본인인증 처리. (handleLogin/openSlaLayer 공용)
+  private async postLoginChecks(): Promise<void> {
+    const page = this.page!;
 
     // 로그인 후 리다이렉트 대기 — accounts.kt.com에서 벗어날 때까지
     try {
       await page.waitForURL((url) => !url.toString().includes('accounts.kt.com'), { timeout: 15000 });
     } catch {
-      // 비밀번호 변경 등 중간 페이지에서 멈출 수 있음
+      // 비밀번호 변경/추가 인증 등 중간 페이지에서 멈출 수 있음
     }
     await sleep(2000);
 
-    const afterUrl = page.url();
-    if (afterUrl.includes('unchanged-password') || afterUrl.includes('change-password')) {
-      info('비밀번호 변경 안내 → 다음에 하기');
-      try {
-        await page.waitForSelector('button', { timeout: 5000 });
-        await page.evaluate(() => {
-          const btns = document.querySelectorAll('button');
-          for (const btn of btns) {
-            const text = btn.textContent || '';
-            if (text.includes('다음에 하기') || text.includes('나중에') || text.includes('Skip')) {
-              btn.click();
-              return;
-            }
-          }
-        });
-        await sleep(3000);
-      } catch {
-        // 다음에 하기 버튼 없음, 계속 진행
+    if (page.url().includes('accounts.kt.com')) {
+      // 아이디/비밀번호 오류를 추가 인증으로 오진하지 않도록 먼저 걸러낸다
+      const loginError = await page.evaluate(() => {
+        const text = document.body?.innerText || '';
+        return ['일치하지 않습니다', '잘못 입력', '아이디 또는 비밀번호', '입력 오류'].some((kw) =>
+          text.includes(kw),
+        );
+      });
+      if (loginError) {
+        throw new Error('KT 로그인에 실패했습니다. 설정 파일의 아이디/비밀번호를 확인하세요.');
       }
     }
+
+    await this.skipPasswordChangeIfPresent();
+
+    // 추가 본인인증(PASS/문자) — 2026-06-12 이후 KT가 로그인에 요구 (이슈 #13).
+    // 계정 단위로 기억되므로 1회 인증된 계정이면 이 단계는 아예 오지 않는다.
+    await this.handleExtraAuth();
+  }
+
+  private async skipPasswordChangeIfPresent(): Promise<void> {
+    const page = this.page!;
+    const url = page.url();
+    if (!url.includes('unchanged-password') && !url.includes('change-password')) {
+      return;
+    }
+    info('비밀번호 변경 안내 → 다음에 하기');
+    try {
+      await page.waitForSelector('button', { timeout: 5000 });
+      await page.evaluate(() => {
+        const btns = document.querySelectorAll('button');
+        for (const btn of btns) {
+          const text = btn.textContent || '';
+          if (text.includes('다음에 하기') || text.includes('나중에') || text.includes('Skip')) {
+            btn.click();
+            return;
+          }
+        }
+      });
+      await sleep(3000);
+    } catch {
+      // 다음에 하기 버튼 없음, 계속 진행
+    }
+  }
+
+  // 로그인 제출 후에도 accounts.kt.com에 머물러 있고 본인인증 화면이 떠 있으면,
+  // 자동 실행에서는 명확한 안내와 함께 실패시키고, --debug 모드에서는
+  // 사용자가 직접 인증을 마칠 때까지 대기한다. KT의 추가 인증은 계정 단위로
+  // 기억되므로(실측 확인) 1회 인증 후에는 매 실행의 신규 로그인도 통과한다.
+  private async handleExtraAuth(): Promise<void> {
+    const page = this.page!;
+
+    if (!page.url().includes('accounts.kt.com')) {
+      return;
+    }
+
+    const needsExtraAuth = await page.evaluate(() => {
+      const text = document.body?.innerText || '';
+      return ['본인인증', '인증번호', '추가 인증', 'PASS 인증'].some((kw) => text.includes(kw));
+    });
+    if (!needsExtraAuth) {
+      return;
+    }
+
+    // config의 headless:false로 무인 실행하는 경우도 있으므로,
+    // 사용자가 지켜보고 있다고 확신할 수 있는 --debug에서만 대기한다
+    if (!this.debugMode) {
+      throw new Error(
+        'KT가 추가 본인인증(PASS/문자)을 요구합니다. 아래 명령으로 브라우저를 열어 1회만 인증하세요:\n' +
+          '  npx -y damn-my-slow-kt@latest run --debug --dry-run --force\n' +
+          '(일반 브라우저에서 speed.kt.com에 로그인해 인증을 마쳐도 됩니다)\n' +
+          '인증은 계정 단위로 기억되므로, 1회 인증 후에는 headless로 자동 실행됩니다.',
+      );
+    }
+
+    info('추가 본인인증(PASS/문자) 감지 — 열린 브라우저에서 인증을 완료해주세요 (최대 5분 대기)');
+    try {
+      await page.waitForURL((url) => !url.toString().includes('accounts.kt.com'), {
+        timeout: 5 * 60 * 1000,
+      });
+    } catch {
+      // 인증 직후 비밀번호 변경 안내 등으로 accounts.kt.com에 머무를 수 있어
+      // URL만으로 단정하지 않고 아래에서 후처리를 시도한다
+    }
+    await sleep(2000);
+    await this.skipPasswordChangeIfPresent();
+
+    if (page.url().includes('accounts.kt.com')) {
+      throw new Error('추가 본인인증이 5분 내에 완료되지 않았습니다. 다시 실행해 인증을 진행해주세요.');
+    }
+    info('추가 인증 완료 — 이후 실행부터는 인증 없이 로그인됩니다');
   }
 
   private async openSlaLayer(): Promise<void> {
@@ -639,30 +719,7 @@ export class KTProvider {
     if (currentUrl.includes('accounts.kt.com')) {
       info('로그인 필요 → 로그인 진행');
       await this.fillLoginForm(id, password);
-
-      // 로그인 후 리다이렉트 대기
-      try {
-        await page.waitForURL((url) => !url.toString().includes('accounts.kt.com'), { timeout: 15000 });
-      } catch {
-        // 비밀번호 변경 안내 등 중간 페이지에서 멈출 수 있음
-      }
-      await sleep(2000);
-
-      // 비밀번호 변경 안내 처리
-      const afterUrl = page.url();
-      if (afterUrl.includes('unchanged-password') || afterUrl.includes('change-password')) {
-        info('비밀번호 변경 안내 → 다음에 하기');
-        await page.evaluate(() => {
-          const btns = document.querySelectorAll('button');
-          for (const btn of btns) {
-            if ((btn.textContent || '').includes('다음에 하기')) {
-              btn.click();
-              return;
-            }
-          }
-        });
-        await sleep(3000);
-      }
+      await this.postLoginChecks();
 
       // 로그인 후 SLA 페이지로 재접속
       if (!page.url().includes('sla/slatest/introduce.asp')) {

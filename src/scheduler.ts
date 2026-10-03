@@ -1,11 +1,11 @@
 /**
- * 자동 스케줄 설치/제거 (macOS launchd / Linux systemd/cron)
+ * 자동 스케줄 설치/제거 (macOS launchd / Linux systemd/cron / Windows 작업 스케줄러)
  */
 
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { Config, DATA_DIR, DEFAULT_CONFIG_PATH } from './config';
 
 /** POSIX shell 안전 문자열 이스케이프. 공백·특수문자가 포함된 경로를 cron/systemd에 안전하게 넘긴다. */
@@ -105,10 +105,26 @@ export function getRunCommand(): string {
 interface ScheduleTime { hour: number; minute: number; }
 
 /**
- * 시작 시간 + 간격 + 최대 횟수로 트리거 시간 목록 생성.
- * 예: 04:00, max=10, interval=120 → 04:00, 06:00, 08:00, ..., 22:00
+ * 트리거 시간 목록 생성.
+ * - schedule.times가 있으면 그대로 사용 (자정을 넘는 스케줄 표현용)
+ * - 없으면 시작 시간 + 간격 + 최대 횟수. 예: 04:00, max=10, interval=120 → 04:00, 06:00, ..., 22:00
  */
-function buildScheduleTimes(config: Config): ScheduleTime[] {
+export function buildScheduleTimes(config: Config): ScheduleTime[] {
+  const explicit = config.schedule.times;
+  if (explicit && explicit.length > 0) {
+    const times: ScheduleTime[] = [];
+    for (const raw of explicit) {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(raw).trim());
+      const hour = m ? Number(m[1]) : NaN;
+      const minute = m ? Number(m[2]) : NaN;
+      if (!m || hour > 23 || minute > 59) {
+        throw new Error(`schedule.times 형식이 잘못되었습니다: "${raw}" (HH:mm, 예: "06:00")`);
+      }
+      if (!times.some((t) => t.hour === hour && t.minute === minute)) times.push({ hour, minute });
+    }
+    return times;
+  }
+
   const [startH, startM] = config.schedule.time.split(':').map(Number);
   const maxAttempts = config.schedule.max_attempts || 10;
   const intervalMin = config.schedule.retry_interval_minutes || 120;
@@ -522,22 +538,289 @@ export function removeLinux(): void {
   }
 }
 
-export function installSchedule(config: Config, configPath: string = DEFAULT_CONFIG_PATH): void {
+// ─────────────────────────────────────────────
+// Windows - 작업 스케줄러 (Task Scheduler)
+// ─────────────────────────────────────────────
+
+/** schedule install이 자동 등록하는 작업 — 이름+경로가 정확히 같은 작업만 "자동 등록"으로 간주 */
+export const WINDOWS_TASK_NAME = 'damn-my-slow-kt';
+export const WINDOWS_TASK_PATH = '\\';
+
+export interface WindowsScheduledTask {
+  name: string;
+  path: string;
+  /** "<Execute> <Arguments>" */
+  actions: string[];
+}
+
+export interface WindowsTaskAction {
+  execute: string;
+  arguments: string;
+}
+
+/**
+ * 자동 등록 작업과 사용자가 직접 등록한 작업을 구분.
+ * 직접 등록한 작업은 이름·폴더가 제각각이라(예: \Custom\KT 자동 속도 측정) 실행 명령으로 찾은 뒤,
+ * 자동 등록 이름·경로와 정확히 일치하지 않으면 모두 수동 등록으로 본다.
+ */
+export function classifyWindowsTasks(tasks: WindowsScheduledTask[]): {
+  auto: WindowsScheduledTask | null;
+  manual: WindowsScheduledTask[];
+} {
+  const isAuto = (t: WindowsScheduledTask) => t.name === WINDOWS_TASK_NAME && t.path === WINDOWS_TASK_PATH;
+  return {
+    auto: tasks.find(isAuto) || null,
+    manual: tasks.filter((t) => !isAuto(t)),
+  };
+}
+
+/** Windows 명령줄 인자 따옴표 — Windows 경로에는 "가 들어갈 수 없으므로 감싸기만 하면 된다 */
+function winQuote(s: string): string {
+  return /[\s&()^|<>]/.test(s) ? `"${s}"` : s;
+}
+
+/**
+ * 작업 스케줄러에 등록할 실행 명령. 작업 스케줄러의 PATH에 의존하지 않도록 절대 경로를 쓴다.
+ * - 글로벌/로컬 설치: node.exe로 dist/index.js를 직접 실행
+ * - npx 임시 캐시에서 실행 중: 캐시가 사라질 수 있으므로 매번 npx.cmd로 실행
+ */
+export function buildWindowsTaskAction(opts: {
+  scriptPath: string;
+  nodePath: string;
+  /** npx 모드에서 쓸 npx.cmd 경로 (기본: PATH의 npx.cmd) */
+  npxPath?: string;
+  configPath: string;
+}): WindowsTaskAction {
+  const runArgs = `run --config "${opts.configPath}"`;
+  if (isNpxTempPath(opts.scriptPath)) {
+    return { execute: opts.npxPath || 'npx.cmd', arguments: `--yes damn-my-slow-kt ${runArgs}` };
+  }
+  return { execute: opts.nodePath, arguments: `${winQuote(opts.scriptPath)} ${runArgs}` };
+}
+
+/** PowerShell 작은따옴표 문자열 — 내부 '는 ''로 이스케이프 (변수 확장 없음) */
+export function psQuote(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+function formatTime(t: ScheduleTime): string {
+  return `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`;
+}
+
+export function buildWindowsRegisterScript(opts: { action: WindowsTaskAction; times: ScheduleTime[] }): string {
+  // 각 호출을 괄호로 감싸야 한다 — 없으면 쉼표 뒤가 앞 호출의 -At 인자 배열로 묶여 변환 오류
+  const triggers = opts.times.map((t) => `(New-ScheduledTaskTrigger -Daily -At ${psQuote(formatTime(t))})`).join(', ');
+  return [
+    `$action = New-ScheduledTaskAction -Execute ${psQuote(opts.action.execute)} -Argument ${psQuote(opts.action.arguments)}`,
+    `$triggers = @(${triggers})`,
+    // 측정 1회 ~25분(최대 40분) — 넉넉히 2시간. 이전 실행이 남아 있으면 새 실행은 건너뜀.
+    '$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries ' +
+      '-DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew',
+    `Register-ScheduledTask -TaskName ${psQuote(WINDOWS_TASK_NAME)} -TaskPath ${psQuote(WINDOWS_TASK_PATH)} ` +
+      `-Action $action -Trigger $triggers -Settings $settings ` +
+      `-Description ${psQuote('KT 품질보증(SLA) 자동 측정 — damn-my-slow-kt schedule install로 등록됨')} -Force | Out-Null`,
+  ].join('\n');
+}
+
+const PS_ERROR_MARKER = 'DMSK_PS_ERROR:';
+
+/**
+ * PowerShell 스크립트 실행 — 한글/따옴표 문제를 피하려고 UTF-16LE base64(-EncodedCommand)로 전달.
+ * -EncodedCommand의 stderr는 CLIXML로 직렬화되어 읽을 수 없으므로, 예외 메시지를 stdout에 표식과 함께 출력한다.
+ */
+function runPowerShell(script: string): string {
+  const wrapped = [
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    'try {',
+    script,
+    `} catch { [Console]::Out.WriteLine('${PS_ERROR_MARKER}' + $_.Exception.Message); exit 1 }`,
+  ].join('\n');
+  const encoded = Buffer.from(wrapped, 'utf16le').toString('base64');
+  return execFileSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+    { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+}
+
+function powerShellErrorMessage(e: unknown): string {
+  const stdout = (e as { stdout?: unknown }).stdout;
+  if (typeof stdout === 'string') {
+    const line = stdout.split(/\r?\n/).find((l) => l.startsWith(PS_ERROR_MARKER));
+    if (line) return line.slice(PS_ERROR_MARKER.length).trim();
+  }
+  return e instanceof Error ? e.message.split('\n')[0] : String(e);
+}
+
+/** 실행 명령이나 이름에 damn-my-slow-kt가 들어간 작업을 모든 폴더에서 찾는다 */
+export function findWindowsScheduledTasks(): WindowsScheduledTask[] {
+  const script = [
+    '$found = @(Get-ScheduledTask | Where-Object {',
+    "  $_.TaskName -like '*damn-my-slow-kt*' -or",
+    "  (@($_.Actions) | Where-Object { \"$($_.Execute) $($_.Arguments)\" -like '*damn-my-slow-kt*' })",
+    '} | ForEach-Object {',
+    '  [pscustomobject]@{ name = $_.TaskName; path = $_.TaskPath;',
+    '    actions = @($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)".Trim() }) }',
+    '})',
+    'ConvertTo-Json -InputObject $found -Depth 4 -Compress',
+  ].join('\n');
+
+  let out: string;
+  try {
+    out = runPowerShell(script);
+  } catch (e: unknown) {
+    throw new Error(`작업 스케줄러 조회 실패: ${powerShellErrorMessage(e)}`);
+  }
+  const parsed: unknown = JSON.parse(out.trim() || '[]');
+  const list = Array.isArray(parsed) ? parsed : [parsed];
+  return list.map((t: { name?: unknown; path?: unknown; actions?: unknown }) => ({
+    name: String(t.name ?? ''),
+    path: String(t.path ?? ''),
+    actions: Array.isArray(t.actions) ? t.actions.map(String) : t.actions ? [String(t.actions)] : [],
+  }));
+}
+
+function formatWindowsTask(t: WindowsScheduledTask): string {
+  return `${t.path}${t.name}`;
+}
+
+export interface WindowsInstallOptions {
+  /** 사용자가 교체를 승인한 직접 등록 작업 목록 (CLI에서 목록을 보여주고 확인받은 그대로) */
+  replaceManualTasks?: WindowsScheduledTask[];
+}
+
+function taskKey(t: WindowsScheduledTask): string {
+  return JSON.stringify([t.path, t.name, [...t.actions].sort()]);
+}
+
+/** 승인받은 작업 목록과 현재 작업 목록이 같은지 — 확인 프롬프트 사이에 작업이 추가/변경되었으면 false */
+export function isSameTaskSet(a: WindowsScheduledTask[], b: WindowsScheduledTask[]): boolean {
+  const ka = a.map(taskKey).sort();
+  const kb = b.map(taskKey).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i]);
+}
+
+function unregisterWindowsTask(name: string, taskPath: string): void {
+  runPowerShell(
+    `Unregister-ScheduledTask -TaskName ${psQuote(name)} -TaskPath ${psQuote(taskPath)} -Confirm:$false -ErrorAction Stop`,
+  );
+}
+
+/**
+ * @returns 등록했으면 true, 직접 등록한 작업이 있어 중복 방지로 건너뛰었으면 false
+ */
+export function installWindows(config: Config, configPath: string, options: WindowsInstallOptions = {}): boolean {
+  const { auto, manual } = classifyWindowsTasks(findWindowsScheduledTasks());
+
+  if (manual.length > 0 && !options.replaceManualTasks) {
+    console.log('⚠️  직접 등록한 damn-my-slow-kt 작업이 이미 있어 중복 등록하지 않았습니다:');
+    for (const t of manual) console.log(`   • ${formatWindowsTask(t)}`);
+    console.log('   자동 등록으로 바꾸려면 터미널에서 schedule install을 다시 실행해 교체를 선택하세요.');
+    return false;
+  }
+  // 승인 이후 작업이 추가/변경되었으면 보여주지 않은 작업을 지우지 않도록 중단
+  if (options.replaceManualTasks && !isSameTaskSet(options.replaceManualTasks, manual)) {
+    throw new Error('확인 이후 작업 스케줄러의 damn-my-slow-kt 작업이 바뀌었습니다. 다시 실행하세요.');
+  }
+
+  const times = buildScheduleTimes(config);
+  // npm은 npx.cmd를 node.exe와 같은 폴더에 설치한다
+  const bundledNpx = path.join(path.dirname(process.execPath), 'npx.cmd');
+  const action = buildWindowsTaskAction({
+    scriptPath: process.argv[1] || '',
+    nodePath: process.execPath,
+    npxPath: fs.existsSync(bundledNpx) ? bundledNpx : undefined,
+    // 작업 스케줄러의 작업 디렉터리는 System32라 상대 경로가 깨진다
+    configPath: path.resolve(configPath),
+  });
+  // 새 작업을 먼저 등록하고 기존 작업을 지운다 — 등록이 실패해도 기존 스케줄이 남도록
+  try {
+    runPowerShell(buildWindowsRegisterScript({ action, times }));
+  } catch (e: unknown) {
+    throw new Error(`작업 스케줄러 등록 실패: ${powerShellErrorMessage(e)}`);
+  }
+
+  const removed: WindowsScheduledTask[] = [];
+  for (const t of manual) {
+    try {
+      unregisterWindowsTask(t.name, t.path);
+      removed.push(t);
+      console.log(`   기존 작업 제거: ${formatWindowsTask(t)}`);
+    } catch (e: unknown) {
+      // 관리자 권한으로 만든 작업/폴더는 일반 권한으로 지울 수 없다 (액세스 거부).
+      // 아직 아무것도 지우지 않았고 새로 만든 작업이면 되돌려서 시작 전 상태로 둔다 (같은 시각 중복 실행 방지).
+      let rollback = '';
+      if (removed.length === 0 && !auto) {
+        try {
+          unregisterWindowsTask(WINDOWS_TASK_NAME, WINDOWS_TASK_PATH);
+          rollback = '\n   새로 등록한 작업은 되돌렸습니다 (변경 없음).';
+        } catch {
+          rollback = `\n   새로 등록한 ${WINDOWS_TASK_PATH}${WINDOWS_TASK_NAME} 작업을 되돌리지 못했습니다. 직접 삭제하세요.`;
+        }
+      } else {
+        rollback = `\n   ${WINDOWS_TASK_PATH}${WINDOWS_TASK_NAME}는 등록된 상태입니다. 남은 작업을 직접 삭제해 중복 실행을 막으세요.`;
+      }
+      throw new Error(
+        `기존 작업 제거 실패 (${formatWindowsTask(t)}): ${powerShellErrorMessage(e)}${rollback}\n` +
+          '   관리자 권한 터미널에서 다시 실행하거나, 작업 스케줄러(taskschd.msc)에서 직접 삭제한 뒤 다시 실행하세요.',
+      );
+    }
+  }
+
+  console.log(`✅ Windows 작업 스케줄러 ${auto ? '갱신' : '등록'} 완료: ${WINDOWS_TASK_PATH}${WINDOWS_TASK_NAME}`);
+  console.log(`   매일 ${times.length}회 실행: ${formatScheduleTimes(times)}`);
+  console.log(`   감면 성공 시 나머지 실행은 자동 스킵됩니다.`);
+  console.log('   Windows에 로그인되어 있을 때만 실행됩니다.');
+  console.log(`\n   제거하려면: npx -y damn-my-slow-kt@latest schedule remove`);
+  return true;
+}
+
+export function removeWindows(): void {
+  const { auto, manual } = classifyWindowsTasks(findWindowsScheduledTasks());
+
+  if (auto) {
+    try {
+      unregisterWindowsTask(WINDOWS_TASK_NAME, WINDOWS_TASK_PATH);
+    } catch (e: unknown) {
+      throw new Error(`작업 스케줄러 제거 실패: ${powerShellErrorMessage(e)}`);
+    }
+    console.log('✅ Windows 작업 스케줄러 제거 완료');
+  } else {
+    console.log('자동 등록된 작업 스케줄러 작업이 없습니다.');
+  }
+
+  // 사용자가 직접 만든 작업은 임의로 지우지 않고 알려만 준다
+  if (manual.length > 0) {
+    console.log('ℹ️  직접 등록한 작업은 제거하지 않았습니다 (작업 스케줄러 taskschd.msc에서 직접 삭제):');
+    for (const t of manual) console.log(`   • ${formatWindowsTask(t)}`);
+  }
+}
+
+export function installSchedule(
+  config: Config,
+  configPath: string = DEFAULT_CONFIG_PATH,
+  windowsOptions: WindowsInstallOptions = {},
+): void {
   const platform = getPlatform();
+
+  // schedule.times를 지정해도 run은 하루 max_attempts회까지만 측정하므로 뒤쪽 시각은 스킵된다.
+  // PC가 꺼져 놓치는 시각을 대비해 일부러 여유분을 두는 구성도 있으므로 경고가 아닌 안내로 표시.
+  const times = buildScheduleTimes(config);
+  if (config.schedule.times && times.length > config.schedule.max_attempts) {
+    console.log(
+      `ℹ️  schedule.times ${times.length}개 중 하루 max_attempts(${config.schedule.max_attempts}회)까지만 측정하고 ` +
+        '나머지는 스킵합니다 (놓친 시각 대비 여유분으로 둔 경우 그대로 두면 됩니다).',
+    );
+  }
 
   if (platform === 'macos') {
     installMacos(config, configPath);
   } else if (platform === 'linux') {
     installLinux(config, configPath);
   } else if (platform === 'windows') {
-    console.log('');
-    const times = buildScheduleTimes(config);
-    console.log('Windows에서는 작업 스케줄러(Task Scheduler)를 사용하세요:');
-    console.log('1. Win + R → taskschd.msc 입력');
-    console.log('2. 기본 작업 만들기 클릭');
-    console.log(`3. 프로그램: npx --yes damn-my-slow-kt run --config ${configPath}`);
-    console.log(`4. 트리거: 매일 ${formatScheduleTimes(times)} (${times.length}개 등록)`);
-    console.log('   (run 내부에서 오늘 완료 여부를 체크하므로 모두 등록해도 안전합니다)');
+    installWindows(config, configPath, windowsOptions);
   } else {
     throw new Error(`지원하지 않는 플랫폼: ${platform}`);
   }
@@ -550,6 +833,8 @@ export function removeSchedule(): void {
     removeMacos();
   } else if (platform === 'linux') {
     removeLinux();
+  } else if (platform === 'windows') {
+    removeWindows();
   } else {
     console.log('이 플랫폼에서는 자동 제거가 지원되지 않습니다.');
   }

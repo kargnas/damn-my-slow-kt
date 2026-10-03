@@ -265,6 +265,30 @@ function defaultResult(): SpeedTestResult {
   };
 }
 
+/** KT 통합 로그인(accounts.kt.com) 페이지인지 — 쿼리스트링의 리다이렉트 URL에 속지 않도록 호스트로 판별 */
+export function isKtAccountsUrl(url: string): boolean {
+  try {
+    return new URL(url).hostname === 'accounts.kt.com';
+  } catch {
+    return false;
+  }
+}
+
+/** 오류 메시지용 URL — Discord/Telegram으로 전송되므로 쿼리·fragment(SSO 상태값 등)는 버리고 host+path만 남김 */
+export function redactUrl(url: string): string {
+  try {
+    const { hostname, pathname } = new URL(url);
+    return `${hostname}${pathname}`;
+  } catch {
+    return '-';
+  }
+}
+
+/** 로그인 직후 뜨는 비밀번호 변경 안내 페이지인지 */
+export function isPasswordChangeUrl(url: string): boolean {
+  return url.includes('unchanged-password') || url.includes('change-password');
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -458,10 +482,14 @@ export class KTProvider {
       result.error = err.message;
       result.sla_result = 'unknown';
 
-      // 오류 스크린샷
+      // 오류 스크린샷 — 스케줄러 실행 시 cwd가 쓰기 불가일 수 있어 데이터 디렉터리에 저장
       try {
-        await this.page?.screenshot({ path: 'kt-error.png' });
-        info('스크린샷 저장: kt-error.png');
+        if (this.page) {
+          const screenshotPath = path.join(DATA_DIR, 'kt-error.png');
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+          await this.page.screenshot({ path: screenshotPath });
+          info(`스크린샷 저장: ${screenshotPath} (URL: ${this.page.url()})`);
+        }
       } catch {
         // ignore
       }
@@ -580,24 +608,33 @@ export class KTProvider {
       throw new Error('KT 계정 정보가 설정되지 않았습니다. 설정 파일을 확인하세요.');
     }
 
-    const url = page.url();
-    if (!url.includes('accounts.kt.com')) {
+    if (!isKtAccountsUrl(page.url())) {
       return;
     }
 
     info('KT 로그인 페이지 감지...');
+    await this.loginOnAccountsPage(id, password);
+  }
+
+  /**
+   * accounts.kt.com 로그인 페이지에서 로그인을 마치고 KT 서비스로 돌아올 때까지 처리.
+   * handleLogin()과 openSlaLayer() 양쪽에서 같은 흐름을 쓰도록 한 곳에 모은다.
+   */
+  private async loginOnAccountsPage(id: string, password: string): Promise<void> {
+    const page = this.page!;
+
     await this.fillLoginForm(id, password);
 
     // 로그인 후 리다이렉트 대기 — accounts.kt.com에서 벗어날 때까지
     try {
-      await page.waitForURL((url) => !url.toString().includes('accounts.kt.com'), { timeout: 15000 });
+      await page.waitForURL((url) => !isKtAccountsUrl(url.href), { timeout: 15000 });
     } catch {
       // 비밀번호 변경 등 중간 페이지에서 멈출 수 있음
     }
     await sleep(2000);
 
     const afterUrl = page.url();
-    if (afterUrl.includes('unchanged-password') || afterUrl.includes('change-password')) {
+    if (isPasswordChangeUrl(afterUrl)) {
       info('비밀번호 변경 안내 → 다음에 하기');
       try {
         await page.waitForSelector('button', { timeout: 5000 });
@@ -611,10 +648,17 @@ export class KTProvider {
             }
           }
         });
-        await sleep(3000);
+        await page.waitForURL((url) => !isKtAccountsUrl(url.href), { timeout: 10000 }).catch(() => undefined);
       } catch {
         // 다음에 하기 버튼 없음, 계속 진행
       }
+    }
+
+    // 여기서도 accounts.kt.com이면 로그인 자체가 실패한 것 — 뒤 단계의 "SLA 레이어가 열리지 않았습니다"로
+    // 뭉뚱그려지지 않도록 원인을 바로 알린다.
+    // 단, 비밀번호 변경 안내에 머문 경우는 로그인은 된 상태이므로 호출부의 SLA 페이지 재접속에 맡긴다.
+    if (isKtAccountsUrl(page.url()) && !isPasswordChangeUrl(page.url())) {
+      throw new Error(`KT 로그인 실패 — 로그인 페이지에서 넘어가지 않았습니다 (${redactUrl(page.url())})`);
     }
   }
 
@@ -635,34 +679,9 @@ export class KTProvider {
     await sleep(3000);
 
     // 로그인 페이지로 리다이렉트 되었는지 확인
-    const currentUrl = page.url();
-    if (currentUrl.includes('accounts.kt.com')) {
+    if (isKtAccountsUrl(page.url())) {
       info('로그인 필요 → 로그인 진행');
-      await this.fillLoginForm(id, password);
-
-      // 로그인 후 리다이렉트 대기
-      try {
-        await page.waitForURL((url) => !url.toString().includes('accounts.kt.com'), { timeout: 15000 });
-      } catch {
-        // 비밀번호 변경 안내 등 중간 페이지에서 멈출 수 있음
-      }
-      await sleep(2000);
-
-      // 비밀번호 변경 안내 처리
-      const afterUrl = page.url();
-      if (afterUrl.includes('unchanged-password') || afterUrl.includes('change-password')) {
-        info('비밀번호 변경 안내 → 다음에 하기');
-        await page.evaluate(() => {
-          const btns = document.querySelectorAll('button');
-          for (const btn of btns) {
-            if ((btn.textContent || '').includes('다음에 하기')) {
-              btn.click();
-              return;
-            }
-          }
-        });
-        await sleep(3000);
-      }
+      await this.loginOnAccountsPage(id, password);
 
       // 로그인 후 SLA 페이지로 재접속
       if (!page.url().includes('sla/slatest/introduce.asp')) {
@@ -690,6 +709,22 @@ export class KTProvider {
   private async fillLoginForm(id: string, password: string): Promise<void> {
     const page = this.page!;
 
+    // 2026-10 개편된 KT 로그인(이슈 #19): 로그인 방법 선택 화면(패스키/문자인증/PASS/아이디 로그인)이
+    // 먼저 뜨고 입력칸이 없다. '아이디 로그인'을 눌러야 accounts.kt.com/login/id 에서 입력칸이 나타난다.
+    // 방법 선택 화면이 없는 구버전 페이지도 지원하도록 둘 중 먼저 보이는 쪽으로 분기한다.
+    const idInput = page.locator('input#id').first();
+    const idLoginBtn = page.getByRole('button', { name: '아이디 로그인', exact: true }).first();
+    await idInput.or(idLoginBtn).first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => undefined);
+    if ((await idLoginBtn.isVisible()) && !(await idInput.isVisible())) {
+      info('로그인 방법 선택 → 아이디 로그인');
+      await idLoginBtn.click();
+      try {
+        await idInput.waitFor({ state: 'visible', timeout: 10000 });
+      } catch {
+        throw new Error(`'아이디 로그인' 선택 후 아이디 입력칸이 나타나지 않았습니다 (${redactUrl(page.url())})`);
+      }
+    }
+
     // accounts.kt.com 로그인 폼: input#id (아이디), input#password (비밀번호)
     // 구버전 호환을 위해 generic selector도 fallback으로 유지
     const idSelectors = ['input#id', "input[name='id']", "input[type='text']"];
@@ -707,39 +742,54 @@ export class KTProvider {
         continue;
       }
     }
-    if (!idFilled) return;
+    // 조용히 return하면 뒤 단계에서 "SLA 레이어가 열리지 않았습니다"로만 보여 원인 파악이 어렵다
+    if (!idFilled) {
+      throw new Error(`KT 로그인 페이지에서 아이디 입력칸을 찾지 못했습니다 (${redactUrl(page.url())})`);
+    }
 
+    let pwFilled = false;
     for (const sel of pwSelectors) {
       try {
         await page.waitForSelector(sel, { timeout: 3000 });
         await page.fill(sel, password);
+        pwFilled = true;
         break;
       } catch {
         continue;
       }
     }
+    if (!pwFilled) {
+      throw new Error(`KT 로그인 페이지에서 비밀번호 입력칸을 찾지 못했습니다 (${redactUrl(page.url())})`);
+    }
 
-    // 로그인 버튼 클릭 — Playwright의 click()으로 안정적인 클릭
+    // 로그인 버튼 클릭 — 입력 전에는 disabled이므로 Playwright click()의 활성화 대기에 맡긴다
     try {
-      const loginBtn = page.locator('button[type="submit"]').filter({ hasText: '로그인' });
-      await loginBtn.waitFor({ state: 'visible', timeout: 3000 });
-      await loginBtn.click();
+      const loginBtn = page.locator('button[type="submit"]').filter({ hasText: '로그인' }).first();
+      await loginBtn.click({ timeout: 10000 });
+      return;
     } catch {
-      // fallback: evaluate로 직접 클릭
-      try {
-        await page.evaluate(() => {
-          const btns = document.querySelectorAll('button, input[type="submit"]');
-          for (const btn of btns) {
-            const text = (btn as HTMLElement).textContent || (btn as HTMLInputElement).value || '';
-            if (text.includes('로그인')) {
-              (btn as HTMLElement).click();
-              return;
-            }
+      // 클릭은 처리됐지만 그 뒤 대기에서 timeout된 경우 — 이미 로그인 페이지를 벗어났으면 중복 제출하지 않음
+      if (!isKtAccountsUrl(page.url())) return;
+    }
+
+    // fallback: 활성화된 '로그인' 버튼을 직접 클릭.
+    // 텍스트를 정확히 비교해야 '패스키 로그인' 같은 다른 로그인 방법 버튼을 누르지 않는다.
+    const clicked = await page
+      .evaluate(() => {
+        const btns = document.querySelectorAll('button, input[type="submit"]');
+        for (const btn of btns) {
+          if ((btn as HTMLButtonElement).disabled) continue;
+          const text = (btn as HTMLElement).textContent || (btn as HTMLInputElement).value || '';
+          if (text.replace(/\s+/g, '') === '로그인') {
+            (btn as HTMLElement).click();
+            return true;
           }
-        });
-      } catch {
-        // 로그인 버튼 없음
-      }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (!clicked) {
+      throw new Error(`KT 로그인 버튼을 누르지 못했습니다 (${redactUrl(page.url())})`);
     }
   }
 

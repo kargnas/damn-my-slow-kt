@@ -44,7 +44,14 @@ import {
 } from "./kt";
 import { sendNotifications } from "./notify";
 import { printHistory, printStats } from "./report";
-import { installSchedule, removeSchedule, getPlatform } from "./scheduler";
+import {
+  installSchedule,
+  removeSchedule,
+  getPlatform,
+  classifyWindowsTasks,
+  findWindowsScheduledTasks,
+  WindowsInstallOptions,
+} from "./scheduler";
 import { checkForUpdates } from "./updater";
 import { checkAndRunMigrations, CURRENT_CONFIG_VERSION } from "./migration";
 
@@ -241,7 +248,7 @@ export function buildCli(): Command {
 
       // 자동 스케줄 설치 여부 물어보기
       const platform = getPlatform();
-      if (platform !== "windows" && platform !== "unknown") {
+      if (platform !== "unknown") {
         const { installSched } = await inquirer.prompt([
           {
             type: "confirm",
@@ -253,7 +260,7 @@ export function buildCli(): Command {
 
         if (installSched) {
           try {
-            installSchedule(cfg, configPath);
+            installSchedule(cfg, configPath, await askWindowsInstallOptions());
           } catch (e: unknown) {
             const err = e instanceof Error ? e : new Error(String(e));
             console.log("");
@@ -279,11 +286,6 @@ export function buildCli(): Command {
             );
           }
         }
-      } else if (platform === "windows") {
-        console.log("\nWindows에서는 작업 스케줄러를 수동으로 설정하세요:");
-        console.log(
-          `  npx -y damn-my-slow-kt@latest schedule install --config ${configPath}`,
-        );
       }
 
       console.log(chalk.dim("\n지금 테스트하려면 실행해보세요:"));
@@ -651,10 +653,15 @@ export function buildCli(): Command {
       console.log(`계정 ID: ${cfg.credentials.id}`);
       console.log(`비밀번호: ${"*".repeat(cfg.credentials.password.length)}`);
       console.log(`계약 속도: ${cfg.plan.speed_mbps} Mbps`);
-      console.log(`첫 측정: ${cfg.schedule.time} (${cfg.schedule.timezone})`);
-      console.log(
-        `최대 측정: ${cfg.schedule.max_attempts}회/일 | ${cfg.schedule.retry_interval_minutes}분 간격`,
-      );
+      if (cfg.schedule.times && cfg.schedule.times.length > 0) {
+        console.log(`측정 시각: ${cfg.schedule.times.join(", ")} (${cfg.schedule.timezone})`);
+        console.log(`최대 측정: ${cfg.schedule.max_attempts}회/일`);
+      } else {
+        console.log(`첫 측정: ${cfg.schedule.time} (${cfg.schedule.timezone})`);
+        console.log(
+          `최대 측정: ${cfg.schedule.max_attempts}회/일 | ${cfg.schedule.retry_interval_minutes}분 간격`,
+        );
+      }
       console.log(
         `감면 성공 시: ${cfg.schedule.stop_on_complaint_success ? "중단" : "계속 측정"}`,
       );
@@ -728,7 +735,7 @@ export function buildCli(): Command {
     .command("install")
     .description("자동 실행 스케줄 등록")
     .option("-c, --config <path>", "설정 파일 경로", DEFAULT_CONFIG_PATH)
-    .action((opts: { config: string }) => {
+    .action(async (opts: { config: string }) => {
       let cfg: Config;
       try {
         cfg = loadConfig(opts.config);
@@ -739,7 +746,7 @@ export function buildCli(): Command {
       }
 
       try {
-        installSchedule(cfg, opts.config);
+        installSchedule(cfg, opts.config, await askWindowsInstallOptions());
       } catch (e: unknown) {
         const err = e instanceof Error ? e : new Error(String(e));
         console.error(chalk.red(`❌ 스케줄 설치 실패: ${err.message}`));
@@ -921,6 +928,35 @@ function printRunResult(
   }
 
   console.log(headerColor(`  └${"─".repeat(boxWidth)}┘`));
+}
+
+// ─── Windows 작업 스케줄러 중복 방지 ─────────────────────────────
+
+/**
+ * Windows에서 사용자가 직접 등록한 damn-my-slow-kt 작업이 있으면 교체 여부를 묻는다.
+ * 그대로 두면 installSchedule이 중복 등록하지 않고 건너뛴다. 비대화형이면 묻지 않고 건너뜀.
+ */
+async function askWindowsInstallOptions(): Promise<WindowsInstallOptions> {
+  if (getPlatform() !== "windows" || !process.stdin.isTTY || !process.stdout.isTTY) return {};
+
+  const { manual } = classifyWindowsTasks(findWindowsScheduledTasks());
+  if (manual.length === 0) return {};
+
+  console.log(chalk.yellow("\n직접 등록한 damn-my-slow-kt 작업이 있습니다:"));
+  for (const t of manual) {
+    console.log(`  • ${t.path}${t.name}`);
+    for (const a of t.actions) console.log(chalk.dim(`      ${a}`));
+  }
+  const { replace } = await inquirer.prompt([
+    {
+      type: "confirm",
+      name: "replace",
+      message: "위 작업을 제거하고 자동 등록 작업으로 교체할까요? (아니오: 기존 작업 유지, 등록 생략)",
+      default: false,
+    },
+  ]);
+  // 화면에 보여주고 승인받은 작업만 교체 대상으로 넘긴다
+  return replace ? { replaceManualTasks: manual } : {};
 }
 
 // ─── KT 속도측정 프로그램 설치 안내 ────────────────────────────────

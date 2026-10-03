@@ -141,7 +141,7 @@ export async function checkAndRunMigrations(
   // 스케줄 재등록
   if (needScheduleReinstall) {
     const platform = getPlatform();
-    if (platform !== 'windows' && platform !== 'unknown') {
+    if (platform !== 'unknown') {
       const { reinstall } = await inquirer.prompt([
         {
           type: 'confirm',

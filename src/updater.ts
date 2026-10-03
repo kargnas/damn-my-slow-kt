@@ -49,9 +49,15 @@ async function fetchLatestVersion(): Promise<string | null> {
   }
 }
 
-function compareVersions(a: string, b: string): number {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
+/**
+ * 업데이트 안내용 버전 비교 — major.minor.patch만 비교한다 (엄밀한 semver 우선순위 아님).
+ * prerelease(0.5.28-idlogin.1 같은 로컬 빌드)를 Number()로 바꾸면 NaN → 0.5.0으로 취급되어
+ * 잘못된 업데이트 안내가 떴다. 같은 core에서 빌드한 로컬 버전에 같은 릴리스를 안내하지 않도록 -prerelease, +metadata는 버린다.
+ */
+export function compareVersions(a: string, b: string): number {
+  const core = (v: string) => v.split(/[-+]/)[0].split('.').map((n) => parseInt(n, 10) || 0);
+  const pa = core(a);
+  const pb = core(b);
   for (let i = 0; i < 3; i++) {
     const na = pa[i] || 0;
     const nb = pb[i] || 0;

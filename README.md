@@ -118,6 +118,8 @@ npx -y damn-my-slow-kt@latest run
 npx -y damn-my-slow-kt@latest schedule remove
 ```
 
+Windows에서는 작업 스케줄러에 `\damn-my-slow-kt` 작업으로 등록되며, Windows에 로그인되어 있을 때만 실행됩니다. 직접 등록해 둔 damn-my-slow-kt 작업이 있으면 중복 등록하지 않고 교체 여부를 물어봅니다. `schedule remove`는 직접 등록한 작업은 지우지 않습니다.
+
 ---
 
 ## 설정 바꾸기
@@ -128,6 +130,8 @@ npx -y damn-my-slow-kt@latest schedule remove
 schedule:
   max_attempts: 10       # 하루 최대 측정 횟수
   retry_interval_minutes: 120  # 측정 간격 (분)
+  # times: ["20:00", "22:00", "00:00", "06:00"]  # 측정 시각 직접 지정 (선택, 자정 넘김 가능)
+  # 횟수·감면 성공은 달력 날짜로 집계 — 자정 이후 측정은 그날 저녁 측정과 같은 날로 묶여 매일 반복됨
 
 notification:
   discord_webhook: ""    # Discord 알림 (선택)

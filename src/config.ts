@@ -29,6 +29,13 @@ export interface Schedule {
   retry_interval_minutes: number;
   /** 감면 신청 성공 시 나머지 시도 중단 */
   stop_on_complaint_success: boolean;
+  /**
+   * 측정 시각 직접 지정 (예: ['20:00', '22:00', '00:00', '06:00']). 지정하면 time/retry_interval_minutes 대신 사용.
+   * 자정을 넘는 스케줄용 — 하루 실행 횟수는 여전히 max_attempts로 제한되고, "오늘"은 달력 날짜 기준.
+   * 매일 반복되는 사이클로 보면 자정 이후 측정분은 다음 날 저녁 측정분과 같은 날로 묶이므로
+   * (예: PC를 18:00~02:30에 켜는 경우) 첫날 이후로는 매일 max_attempts와 감면 기회를 모두 쓸 수 있다.
+   */
+  times?: string[];
 }
 
 export interface Notification {
@@ -110,6 +117,7 @@ export function loadConfig(configPath?: string): Config {
         sched.stop_on_complaint_success !== undefined
           ? Boolean(sched.stop_on_complaint_success)
           : true,
+      ...(Array.isArray(sched.times) && sched.times.length > 0 ? { times: sched.times.map(String) } : {}),
     },
     notification: {
       discord_webhook: notif.discord_webhook || '',
@@ -140,6 +148,8 @@ export function saveConfig(config: Config, configPath?: string): void {
       max_attempts: config.schedule.max_attempts,
       retry_interval_minutes: config.schedule.retry_interval_minutes,
       stop_on_complaint_success: config.schedule.stop_on_complaint_success,
+      // 미지정이면 키 자체를 쓰지 않아 기존 설정 파일 형태를 유지
+      ...(config.schedule.times && config.schedule.times.length > 0 ? { times: config.schedule.times } : {}),
     },
     notification: {
       discord_webhook: config.notification.discord_webhook,

@@ -40,12 +40,16 @@ src/
 ├── migration.ts   # Config version migration system (v1→v2→v3)
 ├── notify.ts      # Discord webhook + Telegram bot notifications
 ├── report.ts      # CLI table output (cli-table3)
-├── scheduler.ts   # OS scheduler install/remove (launchd/systemd/cron)
+├── scheduler.ts   # OS scheduler install/remove (launchd/systemd/cron/Windows Task Scheduler)
 └── updater.ts     # npm registry version check with 24h cache
 tests/
 ├── config.test.ts     # Unit tests for config defaults
 ├── db.test.ts         # SpeedDatabase timezone-aware record tests
-└── kt-parser.test.ts  # SLA result parser unit tests (parseMbpsValue, summarizeSlaResults)
+├── kt-parser.test.ts  # SLA result parser unit tests (parseMbpsValue, summarizeSlaResults)
+├── kt-login.test.ts   # KT login URL helpers (isKtAccountsUrl, isPasswordChangeUrl, redactUrl)
+├── scheduler.test.ts  # Schedule time calculation (schedule.times, start + interval)
+├── scheduler-windows.test.ts  # Windows task classification / action / PowerShell script builders
+└── updater.test.ts    # Update-check version comparison (prerelease builds)
 ```
 
 > Run `tree -I node_modules -I dist` to see the full directory structure.
@@ -54,7 +58,7 @@ tests/
 - **kt.ts** (~1,000 lines): The core business logic. Drives Playwright through KT's SLA test flow. Do NOT modify the browser automation selectors without verifying against the live site
 - **cli.ts** (~1,000 lines): All Commander commands. `run` validates required config fields (credentials + phone) via `validateRequiredFields()` before execution. `init --force` pre-fills prompts with existing config values
 - **config.ts** (~200 lines): YAML config load/save, interfaces, defaults, `validateRequiredFields()` for required field validation
-- **scheduler.ts** (~560 lines): Generates multiple launchd/systemd/cron triggers per day based on `max_attempts` and `retry_interval_minutes`
+- **scheduler.ts** (~800 lines): Generates multiple launchd/systemd/cron/Windows Task Scheduler triggers per day from `schedule.times` (explicit list, may cross midnight) or `time` + `retry_interval_minutes` + `max_attempts`. On Windows it registers only `\damn-my-slow-kt` via PowerShell `-EncodedCommand`, detects tasks the user registered manually (any folder/name whose action contains `damn-my-slow-kt`), and never replaces or removes them without explicit confirmation
 - **db.ts**: Dual storage backend — tries `node:sqlite` first, falls back to JSON file. Both implement the same interface methods
 
 ## Coding Conventions
